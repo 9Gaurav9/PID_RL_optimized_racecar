@@ -1,123 +1,94 @@
-from controller import Camera, GPS, Keyboard
+from controller import Camera, Keyboard
 from vehicle import Driver
 import math
 
-# Constants
+
+
 TIME_STEP = 50
+KP = 0.25
+KI = 0.006
+KD = 2
 FILTER_SIZE = 3
-KP = 0.2
-KI = 0.001
-KD = 0.7
 UNKNOWN = 99999.99
 
-# Initialize Webots driver and keyboard
 driver = Driver()
 keyboard = Keyboard()
 keyboard.enable(TIME_STEP)
 
-# Camera setup
 camera = driver.getDevice("camera")
 camera.enable(TIME_STEP)
 camera_width = camera.getWidth()
 camera_height = camera.getHeight()
 camera_fov = camera.getFov()
 
-# GPS setup
-gps = driver.getDevice("gps")
-gps.enable(TIME_STEP)
+# PID
+pid_reset = True
+integral = 0
+old_value = 0
+angle_history = [0.0] * FILTER_SIZE
 
-# PID state
-pid_need_reset = True
-old_value = 0.0
-integral = 0.0
-line_history = [0.0] * FILTER_SIZE
+# Color matching (yellow line)
+def is_yellow(b, g, r):
+    return abs(b - 95) + abs(g - 187) + abs(r - 203) < 30
 
-# Vehicle setup
-driver.setCruisingSpeed(25)  # start slower for testing
-driver.setDippedBeams(True)
+def process_camera(image):
+    sum_x = 0
+    count = 0
+    for y in range(camera_height // 2, camera_height):  # only bottom half
+        for x in range(camera_width):
+            idx = (y * camera_width + x) * 4
+            b = image[idx]
+            g = image[idx + 1]
+            r = image[idx + 2]
+            if is_yellow(b, g, r):
+                sum_x += x
+                count += 1
+    if count == 0:
+        return UNKNOWN
+    avg_x = sum_x / count
+    return ((avg_x / camera_width) - 0.5) * camera_fov
 
-# === PID Controller ===
-def applyPID(angle):
-    global old_value, integral, pid_need_reset
-    if pid_need_reset:
+def filter_angle(val):
+    if val == UNKNOWN:
+        return UNKNOWN
+    angle_history.pop(0)
+    angle_history.append(val)
+    return sum(angle_history) / len(angle_history)
+
+def apply_pid(angle):
+    global pid_reset, integral, old_value
+    if pid_reset:
         old_value = angle
-        integral = 0.0
-        pid_need_reset = False
-
-    diff = angle - old_value
+        integral = 0
+        pid_reset = False
     if math.copysign(1, angle) != math.copysign(1, old_value):
-        integral = 0.0
+        integral = 0
+    diff = angle - old_value
     if -30 < integral < 30:
         integral += angle
     old_value = angle
     return KP * angle + KI * integral + KD * diff
 
-# === Pixel detection threshold ===
-def is_white_pixel(b, g, r):
-    return b + g + r > 450  # Adjust for slightly off-white/gray
+# Start
+driver.setCruisingSpeed(30)
+driver.setDippedBeams(True)
 
-# === Lane detection ===
-def process_lane_center(image):
-    left_sum = 0
-    right_sum = 0
-    left_count = 0
-    right_count = 0
-
-    for y in range(camera_height):
-        for x in range(camera_width):
-            pixel_index = 4 * (y * camera_width + x)
-            b = image[pixel_index]
-            g = image[pixel_index + 1]
-            r = image[pixel_index + 2]
-
-            if is_white_pixel(b, g, r):
-                if x < camera_width / 2:
-                    left_sum += x
-                    left_count += 1
-                else:
-                    right_sum += x
-                    right_count += 1
-
-    print(f"Left: {left_count}, Right: {right_count}")  # Debug print
-
-    if left_count > 0 and right_count > 0:
-        left_avg = left_sum / left_count
-        right_avg = right_sum / right_count
-        lane_center = (left_avg + right_avg) / 2
-        angle = ((lane_center / camera_width) - 0.5) * camera_fov
-        return angle
-    else:
-        return UNKNOWN
-
-# === Angle smoothing ===
-def filter_angle(new_value):
-    global line_history
-    if new_value == UNKNOWN:
-        return UNKNOWN
-    line_history.pop(0)
-    line_history.append(new_value)
-    return sum(line_history) / len(line_history)
-
-# === Keyboard interaction ===
-def check_keyboard():
+while driver.step() != -1:
     key = keyboard.getKey()
     if key == keyboard.UP:
         driver.setCruisingSpeed(driver.getTargetCruisingSpeed() + 5)
     elif key == keyboard.DOWN:
         driver.setCruisingSpeed(driver.getTargetCruisingSpeed() - 5)
 
-# === Main loop ===
-while driver.step() != -1:
-    check_keyboard()
-    camera_image = camera.getImage()
-    lane_angle = filter_angle(process_lane_center(camera_image))
+    image = camera.getImage()
+    angle = filter_angle(process_camera(image))
 
-    if lane_angle != UNKNOWN:
+    if angle != UNKNOWN:
+        steer = apply_pid(angle)
         driver.setBrakeIntensity(0.0)
-        steer = applyPID(lane_angle)
         driver.setSteeringAngle(steer)
     else:
-        print("❌ Lost lane — braking")
-        driver.setBrakeIntensity(0.5)
+        print("Lost line — Braking")
+        driver.setBrakeIntensity(0.4)
         driver.setSteeringAngle(0.0)
-        pid_need_reset = True
+        pid_reset = True
